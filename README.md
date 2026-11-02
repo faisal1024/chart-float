@@ -6,7 +6,7 @@ No dependencies, no Xcode project. One Swift file, built with `swiftc`.
 
 ## Build and run
 
-Requires macOS 13+ and Xcode Command Line Tools (`xcode-select --install`).
+Requires macOS 14+ and Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
 git clone https://github.com/faisal1024/chart-float.git
@@ -18,6 +18,16 @@ open ChartFloat.app
 Copy `ChartFloat.app` to `/Applications` if you want it in Launchpad.
 
 The app is ad-hoc signed, so on first launch macOS may say it can't verify the developer. Right-click the app, choose Open, then Open again. You only have to do this once.
+
+## Mirror a Chrome tab (picture-in-picture for any window)
+
+Want to watch a tab you already have open in Chrome, logged in and all? Mirror it:
+
+1. In Chrome, right-click the tab and choose **Move Tab to New Window** so the chart has its own window.
+2. In ChartFloat click **Mirror** (or Cmd+M, or the 📈 menu bar item), and pick that Chrome window in the system picker.
+3. The floating panel now shows a live feed of that window, even when Chrome is buried behind other apps or on another Space. Click **Stop** to go back to the built-in browser.
+
+The feed is view-only: clicks land on ChartFloat, not on Chrome. Minimizing the Chrome window stops the feed, so leave it open behind your other windows. The first time, macOS asks you to allow ChartFloat to share the window.
 
 ## Using it
 

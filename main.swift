@@ -1,5 +1,7 @@
 import Cocoa
 import WebKit
+import ScreenCaptureKit
+import AVFoundation
 
 // ChartFloat: a small always-on-top browser window for keeping a chart in view.
 
@@ -14,7 +16,27 @@ final class FloatWindow: NSWindow {
     override var canBecomeMain: Bool { true }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, NSTextFieldDelegate {
+/// Shows a live feed of another app's window via ScreenCaptureKit.
+final class MirrorView: NSView {
+    let displayLayer = AVSampleBufferDisplayLayer()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer = CALayer()
+        layer?.backgroundColor = NSColor.black.cgColor
+        displayLayer.videoGravity = .resizeAspect
+        layer?.addSublayer(displayLayer)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() { super.layout(); displayLayer.frame = bounds }
+    func enqueue(_ sb: CMSampleBuffer) {
+        if displayLayer.status == .failed { displayLayer.flush() }
+        displayLayer.enqueue(sb)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, NSTextFieldDelegate,
+                         SCContentSharingPickerObserver, SCStreamOutput, SCStreamDelegate {
     var window: FloatWindow!
     var webView: WKWebView!
     var toolbar: NSView!
@@ -23,6 +45,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var pinButton: NSButton!
     var statusItem: NSStatusItem!
     var clickThrough = false
+    var mirrorView: MirrorView!
+    var mirrorButton: NSButton!
+    var stream: SCStream?
+    var mirroring = false
+    let streamQueue = DispatchQueue(label: "chartfloat.stream")
     var toolbarHeightConstraint: NSLayoutConstraint!
 
     var pinned: Bool {
@@ -91,7 +118,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         pinButton.setButtonType(.pushOnPushOff)
         pinButton.toolTip = "Always on top"
 
-        let stack = NSStackView(views: [back, reload, urlField, opacitySlider, pinButton])
+        mirrorButton = NSButton(title: "Mirror", target: self, action: #selector(toggleMirror))
+        mirrorButton.bezelStyle = .texturedRounded
+        mirrorButton.toolTip = "Mirror another app's window (e.g. a Chrome tab in its own window)"
+
+        let stack = NSStackView(views: [back, reload, urlField, mirrorButton, opacitySlider, pinButton])
         stack.orientation = .horizontal
         stack.spacing = 6
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 74, bottom: 0, right: 8) // room for traffic lights
@@ -113,6 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
         content.addSubview(webView)
 
+        mirrorView = MirrorView(frame: .zero)
+        mirrorView.translatesAutoresizingMaskIntoConstraints = false
+        mirrorView.isHidden = true
+        content.addSubview(mirrorView)
+
         toolbarHeightConstraint = toolbar.heightAnchor.constraint(equalToConstant: 38)
         NSLayoutConstraint.activate([
             toolbar.topAnchor.constraint(equalTo: content.topAnchor),
@@ -126,6 +162,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             webView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             webView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            mirrorView.topAnchor.constraint(equalTo: webView.topAnchor),
+            mirrorView.leadingAnchor.constraint(equalTo: webView.leadingAnchor),
+            mirrorView.trailingAnchor.constraint(equalTo: webView.trailingAnchor),
+            mirrorView.bottomAnchor.constraint(equalTo: webView.bottomAnchor),
         ])
 
         if !window.setFrameUsingName("ChartFloatMain") {
@@ -180,6 +220,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         webView.load(URLRequest(url: url))
     }
 
+    // MARK: Mirroring
+
+    @objc func toggleMirror() {
+        if mirroring { stopMirroring() } else { pickWindowToMirror() }
+    }
+
+    func pickWindowToMirror() {
+        let picker = SCContentSharingPicker.shared
+        var cfg = SCContentSharingPickerConfiguration()
+        cfg.allowedPickerModes = [.singleWindow]
+        cfg.allowsChangingSelectedContent = true
+        picker.configuration = cfg
+        picker.add(self)
+        picker.isActive = true
+        picker.present(using: .window)
+    }
+
+    func startMirroring(filter: SCContentFilter) {
+        stopMirroring()
+        let cfg = SCStreamConfiguration()
+        let scale = CGFloat(filter.pointPixelScale)
+        cfg.width = max(2, Int(filter.contentRect.width * scale))
+        cfg.height = max(2, Int(filter.contentRect.height * scale))
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: 15)
+        cfg.showsCursor = false
+        cfg.queueDepth = 3
+        cfg.pixelFormat = kCVPixelFormatType_32BGRA
+        cfg.captureResolution = .best
+        let st = SCStream(filter: filter, configuration: cfg, delegate: self)
+        do {
+            try st.addStreamOutput(self, type: .screen, sampleHandlerQueue: streamQueue)
+        } catch {
+            NSLog("addStreamOutput failed: \(error)")
+            return
+        }
+        stream = st
+        mirroring = true
+        mirrorView.isHidden = false
+        webView.isHidden = true
+        mirrorButton.title = "Stop"
+        urlField.isEnabled = false
+        urlField.stringValue = "Mirroring window"
+        if filter.contentRect.width > 0 && filter.contentRect.height > 0 {
+            window.contentAspectRatio = NSSize(width: filter.contentRect.width, height: filter.contentRect.height)
+        }
+        statusItem?.menu?.item(withTag: 4)?.title = "Stop Mirroring"
+        Task {
+            do { try await st.startCapture() } catch {
+                NSLog("startCapture failed: \(error)")
+                await MainActor.run { self.stopMirroring() }
+            }
+        }
+    }
+
+    func stopMirroring() {
+        if let st = stream {
+            Task { try? await st.stopCapture() }
+        }
+        stream = nil
+        guard mirroring else { return }
+        mirroring = false
+        mirrorView.displayLayer.flushAndRemoveImage()
+        mirrorView.isHidden = true
+        webView.isHidden = false
+        mirrorButton.title = "Mirror"
+        urlField.isEnabled = true
+        urlField.stringValue = webView.url?.absoluteString ?? (defaults.string(forKey: kURL) ?? "")
+        window.contentAspectRatio = NSSize(width: 0, height: 0)
+        window.resizeIncrements = NSSize(width: 1, height: 1)
+        statusItem?.menu?.item(withTag: 4)?.title = "Mirror a Window…"
+        SCContentSharingPicker.shared.isActive = false
+    }
+
+    // SCContentSharingPickerObserver
+    func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {}
+    func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
+        DispatchQueue.main.async { self.startMirroring(filter: filter) }
+    }
+    func contentSharingPickerStartDidFailWithError(_ error: Error) {
+        NSLog("picker failed: \(error)")
+    }
+
+    // SCStreamOutput / SCStreamDelegate
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sb.isValid else { return }
+        guard let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = atts.first?[.status] as? Int, raw == SCFrameStatus.complete.rawValue else { return }
+        DispatchQueue.main.async { self.mirrorView.enqueue(sb) }
+    }
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { self.stopMirroring() }
+    }
+
     // MARK: Actions
 
     @objc func goBack() { webView.goBack() }
@@ -230,6 +363,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let tb = m.addItem(withTitle: "Hide Toolbar", action: #selector(toggleToolbar), keyEquivalent: "")
         tb.tag = 3
         m.addItem(.separator())
+        let mi = m.addItem(withTitle: "Mirror a Window…", action: #selector(toggleMirror), keyEquivalent: "")
+        mi.tag = 4
+        m.addItem(.separator())
         m.addItem(withTitle: "Quit ChartFloat", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = m
         applyPin()
@@ -257,6 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         view.addItem(withTitle: "Reload", action: #selector(reload), keyEquivalent: "r")
         view.addItem(withTitle: "Back", action: #selector(goBack), keyEquivalent: "[")
         view.addItem(.separator())
+        view.addItem(withTitle: "Mirror a Window…", action: #selector(toggleMirror), keyEquivalent: "m")
         view.addItem(withTitle: "Always on Top", action: #selector(togglePin), keyEquivalent: "p")
         view.addItem(withTitle: "Click-Through", action: #selector(toggleClickThrough), keyEquivalent: "t")
         view.addItem(withTitle: "Toggle Toolbar", action: #selector(toggleToolbar), keyEquivalent: "b")
